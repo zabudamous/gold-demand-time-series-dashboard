@@ -1,0 +1,162 @@
+---
+title: "Gold_demamd"
+author: "Zeina Abudamous"
+format: html
+editor: visual
+---
+
+```{r Libraries, warning=FALSE, message=FALSE}
+# Libraries 
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(forecast)
+library(broom)
+```
+
+```{r Data}
+# Uploading the Data
+gold <- read_csv("Gold_demand_quarterly.csv")
+
+# Reshaping the dataset
+long_gold <- gold %>%
+  pivot_longer(
+    cols = -Countries,
+    names_to = "Quarter",
+    values_to = "Gold_Demand_Tonnes"
+  ) %>%
+  mutate(
+    Year = str_extract(Quarter, "\\d{2}"),
+    Q = str_extract(Quarter, "Q\\d"),
+    Quarter_Num = as.numeric(str_remove(Q, "Q")),
+    Year = as.numeric(paste0("20", Year)),
+    Date = as.Date(paste0(Year, "-", (Quarter_Num - 1)*3 + 1, "-01"))
+  ) %>%
+  rename(Country = Countries) %>%
+  arrange(Country, Date)
+
+glimpse(long_gold)
+summary(long_gold$Gold_Demand_Tonnes)
+
+long_gold <- long_gold %>%
+  group_by(Country) %>%
+  arrange(Date) %>%
+  mutate(
+    QoQ_Growth = (Gold_Demand_Tonnes / lag(Gold_Demand_Tonnes)) - 1,
+    YoY_Growth = (Gold_Demand_Tonnes / lag(Gold_Demand_Tonnes, 4)) - 1
+  ) %>%
+  ungroup()
+
+# Producing clean dataset
+write_csv(long_gold, "gold_demand_clean.csv")
+```
+
+# Rolling Metrics
+
+```{r Rolling_Metrics}
+# Rolling Metrics
+## 4-quarter window
+
+rolling_metrics <- long_gold %>%
+  group_by(Country) %>%
+  arrange(Date) %>%
+  mutate(
+    Rolling_Mean_4Q = rollmean(Gold_Demand_Tonnes, 4, fill = NA, align = "right"),
+    Rolling_SD_4Q = rollapply(Gold_Demand_Tonnes, 4, sd, fill = NA, align = "right"),
+    Rolling_Zscore = (Gold_Demand_Tonnes - Rolling_Mean_4Q) / Rolling_SD_4Q
+  ) %>%
+  ungroup()
+```
+
+```{r Anomalies}
+# Flagging Statistical Anomalies
+
+anomaly_table <- rolling_metrics %>%
+  mutate(Is_Anomaly = abs(Rolling_Zscore) > 2) %>%
+  select(Country, Date, Gold_Demand_Tonnes, Rolling_Zscore, Is_Anomaly)
+
+# producing (writing) dataset files
+
+write_csv(rolling_metrics, "Rolling_Metrics.csv")
+write_csv(anomaly_table, "Anomaly_Table.csv")
+```
+
+# Volatility Summary
+
+## Executive KPI Table
+
+```{r KPI}
+# KPI Table
+
+volatility_summary <- long_gold %>%
+  group_by(Country) %>%
+  summarise(
+    Mean_Demand = mean(Gold_Demand_Tonnes, na.rm = TRUE),
+    Std_Dev = sd(Gold_Demand_Tonnes, na.rm = TRUE),
+    Coefficient_of_Variation = Std_Dev / Mean_Demand,
+    Trend_Slope = coef(lm(Gold_Demand_Tonnes ~ as.numeric(Date)))[2]
+  ) %>%
+  mutate(
+    Demand_Category = case_when(
+      Coefficient_of_Variation > 0.5 ~ "High Volatility",
+      Coefficient_of_Variation > 0.2 ~ "Moderate Volatility",
+      TRUE ~ "Stable"
+    )
+  )
+
+write_csv(volatility_summary, "Volatility_Summary.csv")
+```
+
+# Forecasting Table
+
+## ARIMA Model
+
+```{r ARIMA}
+
+forecast_table <- long_gold %>%
+  group_by(Country) %>%
+  group_modify(~{
+    ts_data <- ts(.x$Gold_Demand_Tonnes, frequency = 4)
+
+    model <- auto.arima(ts_data)
+    fc <- forecast(model, h = 4)
+
+    tibble(
+      Date = seq(max(.x$Date) %m+% months(3), by = "3 months", length.out = 4),
+      Forecast = as.numeric(fc$mean),
+      Lower_CI = fc$lower[,2],
+      Upper_CI = fc$upper[,2],
+      Model_Type = "ARIMA"
+    )
+  }) %>%
+  ungroup()
+
+write_csv(forecast_table, "Forecast.csv")
+```
+
+# Time Series Decomposition
+
+## STL
+
+```{r STL}
+# Decomposing each country's Time Series
+
+decomposition_table <- long_gold %>%
+  group_by(Country) %>%
+  group_modify(~{
+    ts_data <- ts(.x$Gold_Demand_Tonnes, frequency = 4)
+
+    decomp <- stl(ts_data, s.window = "periodic")
+
+    tibble(
+      Date = .x$Date,
+      Observed = as.numeric(ts_data),
+      Trend = as.numeric(decomp$time.series[, "trend"]),
+      Seasonality = as.numeric(decomp$time.series[, "seasonal"]),
+      Residual = as.numeric(decomp$time.series[, "remainder"])
+    )
+  }) %>%
+  ungroup()
+
+write_csv(decomposition_table, "Decomposition.csv")
+```
